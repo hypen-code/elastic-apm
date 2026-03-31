@@ -1,0 +1,2378 @@
+openapi: 3.0.3
+info:
+  title: Kibana APM API
+  description: >
+    Elastic APM internal API endpoints for tracing and debugging application issues by time range, service name, and error/trace ID.
+
+
+    **CRITICAL CONSTRAINTS:**
+
+
+    1. `kbn-version` header MUST be exactly `"8.19.10"`. Any other value returns 400 "Browser client is out of date".
+
+
+    2. Kibana performs strict server-side schema validation. Missing any required param returns 400 "Failed to validate".
+
+
+    3. Safe defaults to always include: `environment=ENVIRONMENT_ALL`, `kuery=` (empty string), `transactionType=request`,
+       `documentType=serviceTransactionMetric`, `rollupInterval=1m`, `bucketSizeInSeconds=60`, `latencyAggregationType=avg`, `probability=1`.
+
+
+    4. `errorId` (ES document `_id`) is NOT the same as `trace_id` (distributed trace correlation ID).
+       `errorId` must be obtained from `errors/{groupId}/samples → errorSampleIds[]`.
+       Passing a `trace_id` to `event_metadata/error/{errorId}` causes 500.
+
+
+    5. There is NO `/internal/apm/traces/{traceId}` endpoint. Trace waterfall uses `/internal/bsearch` (session cookie auth only, not Basic auth).
+
+
+    6. `/services` aggregates pre-rolled `serviceTransactionMetric` documents which do NOT contain `trace.id`.
+       Do NOT use `trace.id` in the `kuery` parameter on this endpoint.
+  version: 8.19.10
+
+servers:
+  - url: "{baseUrl}"
+    variables:
+      baseUrl:
+        default: http://10.201.218.59:5601
+        description: Kibana base URL (set via BASE_URL in .env)
+
+security:
+  - basicAuth: []
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Set via AUTHORIZATION in .env (Base64 encoded user:password)
+
+  parameters:
+    kbnVersion:
+      name: kbn-version
+      in: header
+      required: true
+      schema:
+        type: string
+        default: "8.19.10"
+        enum: ["8.19.10"]
+      description: "Kibana version header — MUST be exactly '8.19.10'. Wrong value causes 400 Bad Request."
+    serviceName:
+      name: serviceName
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Name of the APM-monitored service
+    start:
+      name: start
+      in: query
+      required: true
+      schema:
+        type: string
+        format: date-time
+      description: Start of time range (ISO 8601)
+    end:
+      name: end
+      in: query
+      required: true
+      schema:
+        type: string
+        format: date-time
+      description: End of time range (ISO 8601)
+    environment:
+      name: environment
+      in: query
+      required: true
+      schema:
+        type: string
+        default: "ENVIRONMENT_ALL"
+      description: "APM environment — REQUIRED by Kibana validation. Use 'ENVIRONMENT_ALL' to include all environments."
+    kuery:
+      name: kuery
+      in: query
+      required: true
+      schema:
+        type: string
+        default: ""
+      description: "KQL filter string — REQUIRED by Kibana validation. Pass empty string '' if no filter needed."
+    offset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: string
+        default: "1d"
+      description: Time offset for comparison period (e.g. 1d)
+    transactionType:
+      name: transactionType
+      in: query
+      required: true
+      schema:
+        type: string
+        default: "request"
+      description: "Transaction type — REQUIRED by Kibana validation on chart endpoints. Use 'request' for web services."
+    documentType:
+      name: documentType
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [serviceTransactionMetric, transactionMetric, transactionEvent]
+        default: "serviceTransactionMetric"
+      description: "Document type — REQUIRED by Kibana validation. Use 'serviceTransactionMetric' for charts, 'transactionMetric' for groups."
+    rollupInterval:
+      name: rollupInterval
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: ["1m", "10m", "60m", "none"]
+        default: "1m"
+      description: "Rollup interval — REQUIRED when documentType is set. Use '1m' for recent data."
+    bucketSizeInSeconds:
+      name: bucketSizeInSeconds
+      in: query
+      required: true
+      schema:
+        type: integer
+        default: 60
+      description: "Bucket size in seconds — REQUIRED by Kibana validation on chart endpoints. Use 60 for 1-minute buckets."
+    numBuckets:
+      name: numBuckets
+      in: query
+      required: true
+      schema:
+        type: integer
+        default: 20
+      description: "REQUIRED by Kibana validation (ToNumber check) on endpoints that use it. Number of time buckets to return. Use 20 as default."
+    latencyAggregationType:
+      name: latencyAggregationType
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [avg, p95, p99]
+        default: "avg"
+      description: "Latency aggregation type — REQUIRED on latency chart endpoints."
+    useDurationSummary:
+      name: useDurationSummary
+      in: query
+      required: false
+      schema:
+        type: boolean
+      description: Whether to use duration summary metrics
+
+  schemas:
+    TimeSeries:
+      type: object
+      properties:
+        x:
+          type: integer
+          description: Timestamp (ms epoch)
+        y:
+          type: number
+          nullable: true
+          description: Metric value
+
+    PeriodTimeSeries:
+      type: object
+      properties:
+        currentPeriod:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/TimeSeries"
+        previousPeriod:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/TimeSeries"
+
+paths:
+
+  # ─────────────────────────────────────────────
+  # FOUNDATION
+  # ─────────────────────────────────────────────
+
+  /internal/apm/data_view/index_pattern:
+    get:
+      tags: [Foundation]
+      summary: Get APM data view index pattern
+      operationId: getApmDataViewIndexPattern
+      description: Returns the Elasticsearch index pattern used by the APM data view.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+      responses:
+        "200":
+          description: APM index pattern string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  apmDataViewIndexPattern:
+                    type: string
+                    description: Comma-separated index pattern covering traces, logs, and metrics
+
+  /internal/apm-sources/settings/apm-indices:
+    get:
+      tags: [Foundation]
+      summary: Get APM index settings per data type
+      operationId: getApmIndexSettings
+      description: Returns the configured Elasticsearch index patterns for each APM data type (transaction, span, error, metric, onboarding, sourcemap).
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+      responses:
+        "200":
+          description: APM index patterns by data type
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transaction:
+                    type: string
+                  span:
+                    type: string
+                  error:
+                    type: string
+                  metric:
+                    type: string
+                  onboarding:
+                    type: string
+                  sourcemap:
+                    type: string
+
+  /internal/apm/has_data:
+    get:
+      tags: [Foundation]
+      summary: Check if APM has ingested data
+      operationId: checkApmHasData
+      description: Returns a boolean indicating whether any APM data exists in the configured indices.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+      responses:
+        "200":
+          description: APM data presence check
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hasData:
+                    type: boolean
+
+  /internal/apm/fleet/has_apm_policies:
+    get:
+      tags: [Foundation]
+      summary: Check if Fleet has APM policies configured
+      operationId: checkFleetHasApmPolicies
+      description: Returns whether any Fleet APM integration policies exist.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+      responses:
+        "200":
+          description: Fleet APM policy presence
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hasApmPolicies:
+                    type: boolean
+
+  # ─────────────────────────────────────────────
+  # DISCOVERY / FILTERS
+  # ─────────────────────────────────────────────
+
+  /internal/apm/environments:
+    get:
+      tags: [Discovery]
+      summary: List APM environments
+      operationId: listEnvironments
+      description: Returns the list of environments observed in APM data for the given time range. Optionally scoped to a specific service.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - name: serviceName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter environments to a specific service
+      responses:
+        "200":
+          description: List of environment names
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  environments:
+                    type: array
+                    items:
+                      type: string
+
+  /internal/apm/fallback_to_transactions:
+    get:
+      tags: [Discovery]
+      summary: Check if APM should fall back to raw transaction documents
+      operationId: checkFallbackToTransactions
+      description: Returns whether the APM UI should fall back from metric-based queries to raw transaction documents for the given time range.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/kuery"
+      responses:
+        "200":
+          description: Fallback flag
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fallbackToTransactions:
+                    type: boolean
+
+  /internal/apm/time_range_metadata:
+    get:
+      tags: [Discovery]
+      summary: Get time range metadata and available metric sources
+      operationId: getTimeRangeMetadata
+      description: Returns available metric document sources (rollup intervals, document types) for the given time range, and whether service destination metrics are available.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/kuery"
+        - name: useSpanName
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Whether to use span name instead of transaction name
+      responses:
+        "200":
+          description: Time range metadata and available sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  isUsingServiceDestinationMetrics:
+                    type: boolean
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        documentType:
+                          type: string
+                          enum: [serviceTransactionMetric, transactionMetric, transactionEvent]
+                        rollupInterval:
+                          type: string
+                        hasDocs:
+                          type: boolean
+                        hasDurationSummaryField:
+                          type: boolean
+
+  # ─────────────────────────────────────────────
+  # SERVICES
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services:
+    get:
+      tags: [Services]
+      summary: List all APM services with summary metrics
+      operationId: listServices
+      description: >
+        Returns the list of services with their latency, error rate, and throughput for the given time range.
+        This endpoint aggregates pre-rolled `serviceTransactionMetric` documents.
+        **WARNING:** Do NOT use `trace.id` in the `kuery` parameter — those rollup documents do not contain `trace.id` fields, causing a 400.
+        `probability` is REQUIRED by Kibana server-side validation (ToNumber check).
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/useDurationSummary"
+        - name: serviceGroup
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Service group filter
+        - name: searchQuery
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Free text search filter for service names
+        - name: probability
+          in: query
+          required: true
+          schema:
+            type: number
+            default: 1
+          description: "REQUIRED by Kibana validation (ToNumber check). Sampling probability 0–1. Use 1 for full sampling."
+      responses:
+        "200":
+          description: List of services with summary metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        serviceName:
+                          type: string
+                        transactionType:
+                          type: string
+                        environments:
+                          type: array
+                          items:
+                            type: string
+                        agentName:
+                          type: string
+                        latency:
+                          type: number
+                          nullable: true
+                          description: Average latency in microseconds
+                        transactionErrorRate:
+                          type: number
+                          nullable: true
+                        throughput:
+                          type: number
+                          nullable: true
+                          description: Transactions per minute
+                  maxCountExceeded:
+                    type: boolean
+                  serviceOverflowCount:
+                    type: integer
+
+  /internal/apm/services/detailed_statistics:
+    post:
+      tags: [Services]
+      summary: Get detailed time-series statistics for a set of services
+      operationId: getServicesDetailedStatistics
+      description: Returns latency, error rate, and throughput time series for specified services over the given time range, with optional previous period comparison.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/bucketSizeInSeconds"
+        - name: probability
+          in: query
+          required: true
+          schema:
+            type: number
+            default: 1
+          description: "REQUIRED by Kibana validation (ToNumber check). Sampling probability 0–1. Use 1 for full sampling."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [serviceNames]
+              properties:
+                serviceNames:
+                  type: string
+                  description: JSON-encoded array of service names
+      responses:
+        "200":
+          description: Time-series metrics per service for current and previous period
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        serviceName:
+                          type: string
+                        latency:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        transactionErrorRate:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        throughput:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        serviceName:
+                          type: string
+                        latency:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        transactionErrorRate:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        throughput:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/services/{serviceName}/agent:
+    get:
+      tags: [Services]
+      summary: Get agent and runtime information for a service
+      operationId: getServiceAgent
+      description: Returns the APM agent name and runtime name detected for the given service.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+      responses:
+        "200":
+          description: Agent and runtime details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentName:
+                    type: string
+                    description: APM agent name (e.g. java, nodejs, python)
+                  runtimeName:
+                    type: string
+                    nullable: true
+                    description: Runtime name (e.g. Java, Node.js)
+
+  /internal/apm/services/{serviceName}/transaction_types:
+    get:
+      tags: [Services]
+      summary: Get transaction types for a service
+      operationId: getServiceTransactionTypes
+      description: Returns the distinct transaction types (e.g. request, background) observed for the given service.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+      responses:
+        "200":
+          description: List of transaction types
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactionTypes:
+                    type: array
+                    items:
+                      type: string
+
+  /internal/apm/services/{serviceName}/alerts_count:
+    get:
+      tags: [Services]
+      summary: Get active alerts count for a service
+      operationId: getServiceAlertsCount
+      description: Returns the count of active alerts for the given service in the specified time range and environment.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+      responses:
+        "200":
+          description: Alerts count for the service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  serviceName:
+                    type: string
+                  alertsCount:
+                    type: integer
+
+  /internal/apm/services/{serviceName}/metadata/icons:
+    get:
+      tags: [Services]
+      summary: Get service icon metadata
+      operationId: getServiceIconMetadata
+      description: Returns the agent name and container type for rendering service icons in the APM UI.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+      responses:
+        "200":
+          description: Icon metadata for the service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentName:
+                    type: string
+                    description: APM agent name used to select icon
+                  containerType:
+                    type: string
+                    nullable: true
+                    description: Container platform (e.g. Kubernetes, Docker)
+
+  # ─────────────────────────────────────────────
+  # TRANSACTIONS
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services/{serviceName}/transactions/charts/latency:
+    get:
+      tags: [Transactions]
+      summary: Get latency time-series chart for a service
+      operationId: getTransactionLatencyChart
+      description: Returns overall average latency and time-series latency data for current and comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/bucketSizeInSeconds"
+        - $ref: "#/components/parameters/latencyAggregationType"
+        - $ref: "#/components/parameters/useDurationSummary"
+        - name: transactionName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific transaction name
+      responses:
+        "200":
+          description: Latency chart data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    properties:
+                      overallAvgDuration:
+                        type: number
+                        nullable: true
+                        description: Overall average duration in microseconds
+                      latencyTimeseries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: object
+                    properties:
+                      overallAvgDuration:
+                        type: number
+                        nullable: true
+                      latencyTimeseries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/services/{serviceName}/transactions/charts/error_rate:
+    get:
+      tags: [Transactions]
+      summary: Get error rate time-series chart for a service
+      operationId: getTransactionErrorRateChart
+      description: Returns transaction error rate time-series and average for current and comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/bucketSizeInSeconds"
+        - name: transactionName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific transaction name
+      responses:
+        "200":
+          description: Error rate chart data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    properties:
+                      timeseries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TimeSeries"
+                      average:
+                        type: number
+                        nullable: true
+                  previousPeriod:
+                    type: object
+                    properties:
+                      timeseries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TimeSeries"
+                      average:
+                        type: number
+                        nullable: true
+
+  /internal/apm/services/{serviceName}/throughput:
+    get:
+      tags: [Transactions]
+      summary: Get throughput time-series chart for a service
+      operationId: getServiceThroughputChart
+      description: Returns transactions-per-minute time-series for current and comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/bucketSizeInSeconds"
+      responses:
+        "200":
+          description: Throughput time-series (transactions per minute)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/services/{serviceName}/transactions/groups/main_statistics:
+    get:
+      tags: [Transactions]
+      summary: Get main statistics for transaction groups
+      operationId: getTransactionGroupsMainStatistics
+      description: Returns aggregated metrics (latency, throughput, error rate, impact) for each transaction group/endpoint.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/latencyAggregationType"
+        - $ref: "#/components/parameters/useDurationSummary"
+        - name: searchQuery
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Free text filter for transaction names
+      responses:
+        "200":
+          description: Transaction group summary statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactionGroups:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          description: Transaction name (e.g. controller#action)
+                        latency:
+                          type: number
+                          nullable: true
+                          description: Average latency in microseconds
+                        throughput:
+                          type: number
+                          nullable: true
+                          description: Transactions per minute
+                        errorRate:
+                          type: number
+                          nullable: true
+                        impact:
+                          type: number
+                          nullable: true
+                          description: Relative impact score (0-100)
+                        alertsCount:
+                          type: integer
+                        transactionType:
+                          type: string
+                  maxCountExceeded:
+                    type: boolean
+                  transactionOverflowCount:
+                    type: integer
+                  hasActiveAlerts:
+                    type: boolean
+
+  /internal/apm/services/{serviceName}/transactions/groups/detailed_statistics:
+    get:
+      tags: [Transactions]
+      summary: Get detailed time-series statistics for specific transaction groups
+      operationId: getTransactionGroupsDetailedStatistics
+      description: Returns latency, throughput, error rate, and impact time-series for a specified list of transaction names.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/documentType"
+        - $ref: "#/components/parameters/rollupInterval"
+        - $ref: "#/components/parameters/bucketSizeInSeconds"
+        - $ref: "#/components/parameters/latencyAggregationType"
+        - $ref: "#/components/parameters/useDurationSummary"
+        - name: transactionNames
+          in: query
+          required: true
+          schema:
+            type: string
+          description: JSON-encoded array of transaction names to fetch detailed statistics for
+      responses:
+        "200":
+          description: Detailed time-series per transaction group for current and previous period
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        transactionName:
+                          type: string
+                        latency:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        throughput:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        errorRate:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        impact:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+
+  /internal/apm/services/{serviceName}/transaction/charts/breakdown:
+    get:
+      tags: [Transactions]
+      summary: Get transaction time breakdown chart
+      operationId: getTransactionBreakdownChart
+      description: Returns stacked area time-series showing time spent in each span type (app, db, external, etc.) for a service.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/transactionType"
+        - name: transactionName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific transaction name
+      responses:
+        "200":
+          description: Time breakdown series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timeseries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                          description: Span type label (e.g. app, db, external)
+                        color:
+                          type: string
+                        type:
+                          type: string
+                        hideLegend:
+                          type: boolean
+                        legendValue:
+                          type: string
+                          nullable: true
+                        data:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+
+  # ─────────────────────────────────────────────
+  # ERRORS
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services/{serviceName}/errors/groups/main_statistics:
+    get:
+      tags: [Errors]
+      summary: Get main statistics for error groups
+      operationId: getErrorGroupsMainStatistics
+      description: Returns the list of error groups with occurrence count, last seen timestamp, type, and trace ID.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - name: sortField
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [occurrences, latestOccurrenceAt, name]
+          description: Field to sort error groups by
+        - name: sortDirection
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: searchQuery
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Free text filter for error names
+      responses:
+        "200":
+          description: Error group summary list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  errorGroups:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        groupId:
+                          type: string
+                          description: Unique hash identifying the error group
+                        name:
+                          type: string
+                          description: Error message or exception name
+                        lastSeen:
+                          type: integer
+                          description: Timestamp (ms epoch) of last occurrence
+                        occurrences:
+                          type: integer
+                        type:
+                          type: string
+                          description: Exception class or error type
+                        traceId:
+                          type: string
+                          nullable: true
+                          description: Trace ID of a sample occurrence (for drill-down)
+                  maxCountExceeded:
+                    type: boolean
+
+  /internal/apm/services/{serviceName}/errors/distribution:
+    get:
+      tags: [Errors]
+      summary: Get error occurrence distribution over time
+      operationId: getErrorDistribution
+      description: Returns a histogram of error occurrences over the time range. Can be scoped to a specific error group.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - name: groupId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Error group hash to scope the distribution to a single error group
+      responses:
+        "200":
+          description: Error distribution histogram
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  bucketSize:
+                    type: integer
+                    description: Bucket duration in milliseconds
+
+  /internal/apm/services/{serviceName}/errors/groups/detailed_statistics:
+    post:
+      tags: [Errors]
+      summary: Get detailed time-series statistics for specific error groups
+      operationId: getErrorGroupsDetailedStatistics
+      description: Returns occurrence time-series for specified error group IDs, with comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/numBuckets"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupIds]
+              properties:
+                groupIds:
+                  type: string
+                  description: JSON-encoded array of error group IDs
+      responses:
+        "200":
+          description: Error group occurrence time-series per group
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        groupId:
+                          type: string
+                        timeseries:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        groupId:
+                          type: string
+                        timeseries:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/services/{serviceName}/errors/{groupId}/samples:
+    get:
+      tags: [Errors]
+      summary: Get error sample IDs for an error group
+      operationId: getErrorGroupSamples
+      description: Returns a list of individual error document IDs (errorSampleIds) for a given error group, used to fetch full error details.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Error group hash ID
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+      responses:
+        "200":
+          description: Error sample IDs and total occurrence count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  errorSampleIds:
+                    type: array
+                    items:
+                      type: string
+                    description: List of individual error document IDs
+                  occurrencesCount:
+                    type: integer
+                    description: Total number of occurrences in the time range
+
+  /internal/apm/services/{serviceName}/errors/{groupId}/top_erroneous_transactions:
+    get:
+      tags: [Errors]
+      summary: Get top transactions associated with an error group
+      operationId: getErrorGroupTopErroneousTransactions
+      description: Returns the transactions that most frequently produce errors in the given error group, with occurrence time-series for current and previous period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Error group hash ID
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/numBuckets"
+      responses:
+        "200":
+          description: Top transactions with this error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topErroneousTransactions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        transactionName:
+                          type: string
+                        occurrences:
+                          type: integer
+                        currentPeriodTimeseries:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        previousPeriodTimeseries:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/services/{serviceName}/errors/{groupId}/error/{errorId}:
+    get:
+      tags: [Errors]
+      summary: Get full details of a single error occurrence
+      operationId: getErrorDetails
+      description: Returns the complete error document and its associated transaction document for a specific error sample ID. Use trace.id and transaction.id for cross-service trace lookup.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Error group hash ID
+        - name: errorId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Individual error document ID (from errors/{groupId}/samples)
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+      responses:
+        "200":
+          description: Full error and transaction document
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    description: Error document
+                    properties:
+                      _id:
+                        type: string
+                      "@timestamp":
+                        type: string
+                        format: date-time
+                      trace:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                            description: Trace ID for distributed tracing lookup
+                      transaction:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                      service:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          environment:
+                            type: string
+                      error:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          grouping_key:
+                            type: string
+                          exception:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                message:
+                                  type: string
+                                stacktrace:
+                                  type: array
+                                  items:
+                                    type: object
+                      agent:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                      timestamp:
+                        type: object
+                        properties:
+                          us:
+                            type: integer
+                  transaction:
+                    type: object
+                    description: Parent transaction document
+                    properties:
+                      trace:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                      transaction:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          type:
+                            type: string
+                      service:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+
+  /internal/apm/event_metadata/error/{errorId}:
+    get:
+      tags: [Errors]
+      summary: Get flat metadata fields for an error event
+      operationId: getErrorEventMetadata
+      description: >
+        Returns all ECS metadata fields (service info, transaction name, container, user agent, trace context) for a given error document ID.
+        **errorId must be an ES document `_id` from `errors/{groupId}/samples → errorSampleIds[]` — NOT a `trace_id`.**
+        Using a `trace_id` as `errorId` causes 500.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - name: errorId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >
+            Elasticsearch document `_id` for an individual error occurrence.
+            Obtain this from `GET errors/{groupId}/samples → errorSampleIds[]`.
+            **CRITICAL:** This is NOT a `trace_id`. Passing a `trace_id` here causes 500
+            ("Cannot read properties of undefined (reading 'fields')").
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+      responses:
+        "200":
+          description: Flat metadata key-value map for the error event
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metadata:
+                    type: object
+                    description: >
+                      Flat map of ECS field paths to arrays of values.
+                      Includes fields such as transaction.name, transaction.id,
+                      trace.id, service.name, container.id, error.exception.type, etc.
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: string
+
+  # ─────────────────────────────────────────────
+  # DEPENDENCIES
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services/{serviceName}/dependencies:
+    get:
+      tags: [Dependencies]
+      summary: Get outbound dependencies for a service
+      operationId: getServiceDependencies
+      description: Returns all downstream dependencies (services and external backends) called by the given service, with latency, throughput, error rate, and impact metrics.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/numBuckets"
+      responses:
+        "200":
+          description: List of service dependencies with metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  serviceDependencies:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        location:
+                          type: object
+                          properties:
+                            type:
+                              type: string
+                              description: Dependency type (service or external)
+                            dependencyName:
+                              type: string
+                            serviceName:
+                              type: string
+                              nullable: true
+                            agentName:
+                              type: string
+                              nullable: true
+                            environment:
+                              type: string
+                              nullable: true
+                            id:
+                              type: string
+                        currentStats:
+                          type: object
+                          properties:
+                            latency:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            throughput:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            errorRate:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            impact:
+                              type: number
+                              nullable: true
+                        previousStats:
+                          type: object
+                          nullable: true
+
+  /internal/apm/services/{serviceName}/dependencies/breakdown:
+    get:
+      tags: [Dependencies]
+      summary: Get time spent per dependency type for a service
+      operationId: getServiceDependenciesBreakdown
+      description: Returns time-series showing how much time (microseconds) the service spent on each dependency (redis, oracle, http, etc.) per bucket.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+      responses:
+        "200":
+          description: Dependency time breakdown by type
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  breakdown:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                          description: Dependency type or name (e.g. redis, oracle, http)
+                        data:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/dependencies/metadata:
+    get:
+      tags: [Dependencies]
+      summary: Get metadata for a specific dependency
+      operationId: getDependencyMetadata
+      description: Returns span type and subtype metadata for a dependency (e.g. db/oracle, messaging/kafka) identified by name.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - name: dependencyName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Dependency identifier (e.g. oracle/VIDA4PDB.hmg.local)
+      responses:
+        "200":
+          description: Dependency metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metadata:
+                    type: object
+                    properties:
+                      spanType:
+                        type: string
+                        description: Span type (e.g. db, messaging, external)
+                      spanSubtype:
+                        type: string
+                        nullable: true
+                        description: Span subtype (e.g. oracle, redis, http)
+
+  /internal/apm/dependencies/charts/latency:
+    get:
+      tags: [Dependencies]
+      summary: Get latency chart for a dependency
+      operationId: getDependencyLatencyChart
+      description: Returns latency time-series for a specific dependency with optional comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - name: dependencyName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Dependency identifier
+        - name: spanName
+          in: query
+          required: true
+          schema:
+            type: string
+            default: ""
+          description: "REQUIRED by Kibana validation. Filter to a specific span name within the dependency, or pass empty string '' to include all spans."
+        - name: searchServiceDestinationMetrics
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Whether to use service destination metrics
+      responses:
+        "200":
+          description: Dependency latency time-series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentTimeseries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  comparisonTimeseries:
+                    type: array
+                    nullable: true
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/dependencies/charts/throughput:
+    get:
+      tags: [Dependencies]
+      summary: Get throughput chart for a dependency
+      operationId: getDependencyThroughputChart
+      description: Returns throughput time-series for a specific dependency with optional comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - name: dependencyName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Dependency identifier
+        - name: spanName
+          in: query
+          required: true
+          schema:
+            type: string
+            default: ""
+          description: "REQUIRED by Kibana validation. Filter to a specific span name, or pass empty string '' to include all spans."
+        - name: searchServiceDestinationMetrics
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Dependency throughput time-series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentTimeseries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  comparisonTimeseries:
+                    type: array
+                    nullable: true
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/dependencies/charts/error_rate:
+    get:
+      tags: [Dependencies]
+      summary: Get error rate chart for a dependency
+      operationId: getDependencyErrorRateChart
+      description: Returns error rate time-series for a specific dependency with optional comparison period.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - name: dependencyName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Dependency identifier
+        - name: spanName
+          in: query
+          required: true
+          schema:
+            type: string
+            default: ""
+          description: "REQUIRED by Kibana validation. Filter to a specific span name, or pass empty string '' to include all spans."
+        - name: searchServiceDestinationMetrics
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Dependency error rate time-series
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentTimeseries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+                  comparisonTimeseries:
+                    type: array
+                    nullable: true
+                    items:
+                      $ref: "#/components/schemas/TimeSeries"
+
+  /internal/apm/dependencies/upstream_services:
+    get:
+      tags: [Dependencies]
+      summary: Get services that call a specific dependency
+      operationId: getDependencyUpstreamServices
+      description: Returns all services that make calls to the given dependency, with latency, throughput, and error rate metrics.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/numBuckets"
+        - name: dependencyName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Dependency identifier
+      responses:
+        "200":
+          description: List of upstream services
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        location:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            serviceName:
+                              type: string
+                            environment:
+                              type: string
+                            agentName:
+                              type: string
+                            type:
+                              type: string
+                        currentStats:
+                          type: object
+                          properties:
+                            latency:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            throughput:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            errorRate:
+                              type: object
+                              properties:
+                                value:
+                                  type: number
+                                  nullable: true
+                                timeseries:
+                                  type: array
+                                  items:
+                                    $ref: "#/components/schemas/TimeSeries"
+                            impact:
+                              type: number
+                              nullable: true
+                        previousStats:
+                          type: object
+                          nullable: true
+
+  # ─────────────────────────────────────────────
+  # SERVICE INSTANCES
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services/{serviceName}/service_overview_instances/main_statistics:
+    get:
+      tags: [Instances]
+      summary: Get main statistics per service instance (node)
+      operationId: getServiceInstancesMainStatistics
+      description: Returns latency, throughput, error rate, CPU, and memory usage per service node/container for the given time range.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/latencyAggregationType"
+        - name: sortField
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [throughput, latency, errorRate, cpuUsage, memoryUsage]
+        - name: sortDirection
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+      responses:
+        "200":
+          description: Per-instance metrics for current and previous period
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        serviceNodeName:
+                          type: string
+                          description: Container or node identifier
+                        latency:
+                          type: number
+                          nullable: true
+                          description: Average latency in microseconds
+                        throughput:
+                          type: number
+                          nullable: true
+                        errorRate:
+                          type: number
+                          nullable: true
+                        cpuUsage:
+                          type: number
+                          nullable: true
+                        memoryUsage:
+                          type: number
+                          nullable: true
+                  previousPeriod:
+                    type: array
+                    items:
+                      type: object
+
+  /internal/apm/services/{serviceName}/service_overview_instances/detailed_statistics:
+    get:
+      tags: [Instances]
+      summary: Get detailed time-series statistics per service instance
+      operationId: getServiceInstancesDetailedStatistics
+      description: Returns time-series for latency, throughput, error rate, CPU, and memory for specified service node IDs.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - $ref: "#/components/parameters/offset"
+        - $ref: "#/components/parameters/transactionType"
+        - $ref: "#/components/parameters/numBuckets"
+        - $ref: "#/components/parameters/latencyAggregationType"
+        - name: serviceNodeIds
+          in: query
+          required: true
+          schema:
+            type: string
+          description: JSON-encoded array of service node (container) IDs
+      responses:
+        "200":
+          description: Time-series per instance for current and previous period
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currentPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        serviceNodeName:
+                          type: string
+                        latency:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        throughput:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        errorRate:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        cpuUsage:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                        memoryUsage:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/TimeSeries"
+                  previousPeriod:
+                    type: object
+                    additionalProperties:
+                      type: object
+
+  # ─────────────────────────────────────────────
+  # INFRASTRUCTURE & METRICS
+  # ─────────────────────────────────────────────
+
+  /internal/apm/services/{serviceName}/infrastructure_attributes:
+    get:
+      tags: [Infrastructure]
+      summary: Get infrastructure attributes for a service
+      operationId: getServiceInfrastructureAttributes
+      description: Returns the container IDs, host names, and pod names associated with the given service, for linking to infrastructure metrics.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+      responses:
+        "200":
+          description: Infrastructure identifiers for the service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  containerIds:
+                    type: array
+                    items:
+                      type: string
+                    description: Container runtime IDs (e.g. containerd-...)
+                  hostNames:
+                    type: array
+                    items:
+                      type: string
+                  podNames:
+                    type: array
+                    items:
+                      type: string
+                    description: Kubernetes pod names
+
+  /internal/apm/services/{serviceName}/metrics/charts:
+    get:
+      tags: [Infrastructure]
+      summary: Get JVM / runtime metrics charts for a service
+      operationId: getServiceMetricsCharts
+      description: Returns agent-specific runtime metric charts (CPU, memory, heap, GC, thread count) for the given service. Charts available depend on the agent type.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - $ref: "#/components/parameters/kuery"
+        - name: agentName
+          in: query
+          required: true
+          schema:
+            type: string
+          description: APM agent name (e.g. java, nodejs) to determine which metrics to return
+        - name: serviceNodeName
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific service node/container
+      responses:
+        "200":
+          description: Runtime metrics charts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                          description: Chart display title (e.g. CPU usage, Heap memory)
+                        key:
+                          type: string
+                          description: Chart identifier (e.g. cpu_usage_chart, heap_memory_area_chart)
+                        yUnit:
+                          type: string
+                          description: Unit for the y-axis (e.g. percent, bytes)
+                        series:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              title:
+                                type: string
+                              key:
+                                type: string
+                              type:
+                                type: string
+                              color:
+                                type: string
+                              overallValue:
+                                type: number
+                                nullable: true
+                              data:
+                                type: array
+                                items:
+                                  $ref: "#/components/schemas/TimeSeries"
+
+  # ─────────────────────────────────────────────
+  # ANNOTATIONS & DASHBOARDS
+  # ─────────────────────────────────────────────
+
+  /api/apm/services/{serviceName}/annotation/search:
+    get:
+      tags: [Annotations]
+      summary: Search for deployment annotations for a service
+      operationId: getServiceAnnotations
+      description: Returns deployment annotations (version releases, deploys) for the given service and time range. Requires elastic-api-version header.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+        - $ref: "#/components/parameters/environment"
+        - name: elastic-api-version
+          in: header
+          required: true
+          schema:
+            type: string
+            default: "2023-10-31"
+          description: Elastic API version header required for public API endpoints
+      responses:
+        "200":
+          description: List of deployment annotations in the time range
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  annotations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                          description: Annotation type (e.g. version)
+                        id:
+                          type: string
+                        "@timestamp":
+                          type: string
+                          format: date-time
+                        text:
+                          type: string
+                          description: Annotation label
+                        service:
+                          type: object
+                          properties:
+                            name:
+                              type: string
+                            environment:
+                              type: string
+                            version:
+                              type: string
+
+  /internal/apm/services/{serviceName}/dashboards:
+    get:
+      tags: [Annotations]
+      summary: Get linked dashboards for a service
+      operationId: getServiceLinkedDashboards
+      description: Returns custom Kibana dashboards linked to the given service.
+      parameters:
+        - $ref: "#/components/parameters/kbnVersion"
+        - $ref: "#/components/parameters/serviceName"
+        - $ref: "#/components/parameters/start"
+        - $ref: "#/components/parameters/end"
+      responses:
+        "200":
+          description: Linked dashboards for the service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  serviceDashboards:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        dashboardSavedObjectId:
+                          type: string
+                        serviceFiltersEnabled:
+                          type: boolean
+
+  # ─────────────────────────────────────────────
+  # TRACES
+  # ─────────────────────────────────────────────
+
+  /api/console/proxy:
+    post:
+      tags: [Traces]
+      summary: Search by trace ID
+      operationId: searchByTraceId
+      description: >
+        Searches `traces-apm*` index for all spans and transactions belonging to a given `trace.id`,
+        proxied through Kibana's console proxy endpoint.
+        Results are sorted by `@timestamp` ascending.
+
+
+        **Note:** Uses `kbn-xsrf: true` instead of `kbn-version` header.
+        Basic auth is sufficient — no session cookie required.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+            default: "traces-apm*/_search"
+          description: Elasticsearch index pattern and API path to proxy to
+        - name: method
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [POST]
+            default: "POST"
+          description: HTTP method to forward to Elasticsearch
+        - name: kbn-xsrf
+          in: header
+          required: true
+          schema:
+            type: string
+            default: "true"
+          description: Required CSRF header for Kibana write/proxy endpoints
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query, size, sort]
+              properties:
+                query:
+                  type: object
+                  required: [term]
+                  properties:
+                    term:
+                      type: object
+                      required: ["trace.id"]
+                      properties:
+                        "trace.id":
+                          type: string
+                          description: Distributed trace correlation ID (32-char hex)
+                          example: "388bc5b312cec10f41cf680528de543a"
+                size:
+                  type: integer
+                  default: 100
+                  description: Maximum number of hits to return
+                sort:
+                  type: array
+                  items:
+                    type: object
+                  default: [{ "@timestamp": "asc" }]
+                  description: Sort order for results
+            example:
+              query:
+                term:
+                  "trace.id": "388bc5b312cec10f41cf680528de543a"
+              size: 100
+              sort:
+                - "@timestamp": "asc"
+      responses:
+        "200":
+          description: Elasticsearch search response containing all trace spans and transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  took:
+                    type: integer
+                    description: Time in milliseconds for Elasticsearch to execute the query
+                  timed_out:
+                    type: boolean
+                  _shards:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      successful:
+                        type: integer
+                      skipped:
+                        type: integer
+                      failed:
+                        type: integer
+                  hits:
+                    type: object
+                    properties:
+                      total:
+                        type: object
+                        properties:
+                          value:
+                            type: integer
+                            description: Total number of matching documents
+                          relation:
+                            type: string
+                            enum: [eq, gte]
+                      hits:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            _index:
+                              type: string
+                              description: Data stream index name (e.g. .ds-traces-apm-default-2026.03.31-002795)
+                            _id:
+                              type: string
+                              description: Elasticsearch document ID
+                            _score:
+                              type: number
+                              nullable: true
+                            _ignored:
+                              type: array
+                              items:
+                                type: string
+                              description: Fields ignored during indexing (e.g. oversized span.db.statement)
+                            _source:
+                              type: object
+                              properties:
+                                "@timestamp":
+                                  type: string
+                                  format: date-time
+                                trace:
+                                  type: object
+                                  properties:
+                                    id:
+                                      type: string
+                                parent:
+                                  type: object
+                                  properties:
+                                    id:
+                                      type: string
+                                      description: Parent span ID
+                                processor:
+                                  type: object
+                                  properties:
+                                    event:
+                                      type: string
+                                      enum: [span, transaction, error]
+                                service:
+                                  type: object
+                                  properties:
+                                    name:
+                                      type: string
+                                    environment:
+                                      type: string
+                                    node:
+                                      type: object
+                                      properties:
+                                        name:
+                                          type: string
+                                    runtime:
+                                      type: object
+                                      properties:
+                                        name:
+                                          type: string
+                                        version:
+                                          type: string
+                                    language:
+                                      type: object
+                                      properties:
+                                        name:
+                                          type: string
+                                        version:
+                                          type: string
+                                    target:
+                                      type: object
+                                      properties:
+                                        name:
+                                          type: string
+                                        type:
+                                          type: string
+                                span:
+                                  type: object
+                                  description: Present when processor.event is 'span'
+                                transaction:
+                                  type: object
+                                  description: Present when processor.event is 'transaction'
+                                agent:
+                                  type: object
+                                  properties:
+                                    name:
+                                      type: string
+                                    version:
+                                      type: string
+                                    ephemeral_id:
+                                      type: string
+                                    activation_method:
+                                      type: string
+                                container:
+                                  type: object
+                                  properties:
+                                    id:
+                                      type: string
+                                host:
+                                  type: object
+                                  properties:
+                                    hostname:
+                                      type: string
+                                    name:
+                                      type: string
+                                    ip:
+                                      type: array
+                                      items:
+                                        type: string
+                                    architecture:
+                                      type: string
+                                    os:
+                                      type: object
+                                      properties:
+                                        platform:
+                                          type: string
+                                destination:
+                                  type: object
+                                  description: Downstream dependency address (present on outbound spans)
+                                  properties:
+                                    address:
+                                      type: string
+                                    port:
+                                      type: integer
+                                data_stream:
+                                  type: object
+                                  properties:
+                                    namespace:
+                                      type: string
+                                    type:
+                                      type: string
+                                    dataset:
+                                      type: string
+                                observer:
+                                  type: object
+                                  properties:
+                                    hostname:
+                                      type: string
+                                    type:
+                                      type: string
+                                    version:
+                                      type: string
+                                event:
+                                  type: object
+                                  properties:
+                                    ingested:
+                                      type: string
+                                      format: date-time
+                                process:
+                                  type: object
+                                  properties:
+                                    pid:
+                                      type: integer
+                                    title:
+                                      type: string
+                                timestamp:
+                                  type: object
+                                  properties:
+                                    us:
+                                      type: integer
+                                      description: Event timestamp in microseconds
