@@ -18,13 +18,18 @@ Elastic APM's internal Kibana endpoints are strict. Failing to provide exact par
     *   **`documentType`**:
         *   Use `"serviceTransactionMetric"` when looking at service-level endpoints.
         *   Use `"transactionMetric"` when looking at specific transaction groups.
+    *   **`offset`**: When comparing time periods, use the `offset` parameter (e.g. `1d` for 1 day).
 
 2.  **`errorId` vs `trace.id`**:
     *   **CRITICAL ERROR PREVENTION**: An `errorId` (Elasticsearch document `_id`) is **NOT** a distributed trace ID (`trace.id`).
     *   You cannot pass a `trace.id` to endpoints expecting an `errorId` (like `getErrorDetails` or `getErrorEventMetadata`). This will cause an HTTP 500.
     *   **To get an `errorId`**: You MUST first call `getErrorGroupSamples` for a specific `groupId`, which returns a list of `errorSampleIds`. Use one of these.
 
-3.  **Cross-Service Tracing Limitations**:
+3.  **Special Endpoint Requirements**:
+    *   **`getServiceAnnotations`**: Requires the `elastic-api-version` header (default `"2023-10-31"`).
+    *   **`searchByTraceId`**: This proxies an Elasticsearch query. It requires `kbn-xsrf: "true"` instead of `kbn-version`.
+
+4.  **Cross-Service Tracing Limitations**:
     *   Rollup document endpoints (like `listServices`) do NOT contain `trace.id` fields. Do not use `trace.id` in KQL queries (`kuery`) for these endpoints.
     *   To find an entire trace sequence, use `searchByTraceId` which directly queries the `traces-apm*` Elasticsearch indices.
 
@@ -35,7 +40,7 @@ Elastic APM's internal Kibana endpoints are strict. Failing to provide exact par
 Do not pull all data at once. Use a deliberate, cascading approach.
 
 ### Playbook A: High Latency Investigation
-1.  **Scope the Issue**: Call `getServicesDetailedStatistics` to confirm the latency spike for the specific service over the current time range.
+1.  **Scope the Issue**: Call `getServicesDetailedStatistics` (optional: add `offset="1d"`) to confirm the latency spike for the specific service over the current time range vs previous.
 2.  **Identify the Bottleneck**: Call `getTransactionGroupsMainStatistics` to find the exact endpoint/transaction group responsible for the high latency (sort by impact or latency).
 3.  **Trace Dependencies (Downstream)**: If the transaction itself is slow, call `getServiceDependencies` to see if an external call (e.g., Database, Third-party API, Redis) is blocking the transaction.
 4.  **Deep Dive Downstream**: Call `getServiceDependenciesBreakdown` or `getDependencyLatencyChart` to isolate exactly which external span type is at fault.
@@ -50,6 +55,10 @@ Do not pull all data at once. Use a deliberate, cascading approach.
 1.  **Identify the Failing Dependency**: Once you know a service or external dependency (e.g., an Oracle DB) is failing.
 2.  **Assess Blast Radius**: Call `getDependencyUpstreamServices` to see *every* other microservice in the cluster that relies on this failing dependency. This determines the severity of the outage.
 
+### Playbook D: Deployment / Release Correlation (Advanced)
+1.  **Check Annotations**: Call `getServiceAnnotations` to see if a recent deployment or configuration change coincides with the start of the latency or error spike.
+2.  **Correlate with Distribution**: Call `getErrorDistribution` for a specific error group to see if occurrences spiked immediately after the deployment.
+
 ---
 
 ## 🧰 Comprehensive Tool & Function Catalog
@@ -62,9 +71,10 @@ Grouped logically by investigation stage.
 
 ### 2. Service Level Metrics
 *   `listServices`: Get a bird's-eye view of all services (latency, throughput, error rate).
-*   `getServicesDetailedStatistics`: Fetch time-series charts for specific services to spot spikes over time.
+*   `getServicesDetailedStatistics`: Fetch time-series charts for specific services to spot spikes over time. Use `offset` for historical comparisons.
 *   `getServiceThroughputChart`, `getTransactionLatencyChart`, `getTransactionErrorRateChart`: Drill into specific metric trends for a single service.
 *   `getServiceInstancesMainStatistics`: Check if a specific Kubernetes Pod or Container is the single source of failure (e.g., OOM kill, high CPU on one node).
+*   `getServiceAnnotations`: Search for recent version deployments.
 
 ### 3. Transaction Drill-Down
 *   `getTransactionGroupsMainStatistics`: **Crucial.** Breaks down a service's performance into individual endpoints/routes.
@@ -73,6 +83,7 @@ Grouped logically by investigation stage.
 
 ### 4. Error Analysis
 *   `getErrorGroupsMainStatistics`: List exceptions grouped by signature.
+*   `getErrorDistribution`: View a histogram of occurrences over time to spot sudden spikes.
 *   `getErrorGroupTopErroneousTransactions`: See which endpoints trigger a specific error.
 *   `getErrorGroupSamples`: **Required** to get an `errorId` for deep diving.
 *   `getErrorDetails`: Fetches the full stack trace and metadata for a single error.
@@ -81,11 +92,12 @@ Grouped logically by investigation stage.
 ### 5. Dependency & Infrastructure Mapping
 *   `getServiceDependencies`: (Outbound) Who does this service call?
 *   `getDependencyUpstreamServices`: (Inbound) Who calls this service? (Blast radius).
+*   `getDependencyLatencyChart`, `getDependencyThroughputChart`, `getDependencyErrorRateChart`: Drill into a specific dependency's performance over time.
 *   `getServiceMetricsCharts`: View JVM Heap, GC rates, CPU, and Memory for memory leak or CPU exhaustion investigations.
 *   `getServiceInfrastructureAttributes`: Find exact K8s Pod Names or Container IDs.
 
 ### 6. Full Distributed Tracing
-*   `searchByTraceId`: When you have a `trace.id` (often found via `getErrorGroupsMainStatistics` or `getErrorDetails`), use this to fetch the entire waterfall of spans across all microservices to see the exact execution path.
+*   `searchByTraceId`: When you have a `trace.id` (often found via `getErrorGroupsMainStatistics` or `getErrorDetails`), use this to fetch the entire waterfall of spans across all microservices to see the exact execution path. (Requires `kbn-xsrf` instead of `kbn-version`).
 
 ---
 
